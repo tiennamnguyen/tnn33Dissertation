@@ -1,8 +1,6 @@
 # Personalised Multimodal Soccer Video Summarisation
 
-This repository contains the implementation for a dissertation project on personalised soccer video summarisation using SoccerNet videos and multimodal scoring. The system takes a SoccerNet match half and its `Labels-v2.json` annotation file, generates candidate clips around annotated events, scores those clips using selected modalities, and exports a short highlight summary video.
-
-The implementation is designed as a practical research prototype rather than a fully trained end-to-end video summarisation model. It combines SoccerNet event annotations with optional multimodal signals such as CLIP scene recognition, Grounding DINO object grounding, audio excitement scoring, and optical-flow motion scoring.
+This repository contains the implementation for a dissertation project on personalised soccer video summarisation using SoccerNet videos and multimodal scoring. The system takes a SoccerNet match half and its `Labels-v2.json` annotation file, generates candidate clips around annotated events, scores those clips using selected modalities, and exports a short highlight summary video. 
 
 ## Main Features
 
@@ -61,12 +59,6 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-On Windows:
-
-```bash
-python -m venv venv
-venv\Scripts\activate
-```
 
 ### 3. Install Python dependencies
 
@@ -230,7 +222,6 @@ python final_soccer.py \
   --report outputs/full_multimodal.json
 ```
 
-These runs can be compared using the generated JSON reports.
 
 ## Output Files
 
@@ -257,38 +248,6 @@ The JSON report contains:
 - final fused score
 - evaluation metrics
 
-Example report structure:
-
-```json
-{
-  "selected_clips": [
-    {
-      "label": "Shots on target",
-      "half": 1,
-      "event_time": 123.45,
-      "start": 109.45,
-      "end": 137.45,
-      "event_score": 0.85,
-      "scene_score": 0.0,
-      "grounding_score": 0.0,
-      "audio_score": 0.0,
-      "flow_score": 0.0,
-      "final_score": 0.85
-    }
-  ],
-  "evaluation": {
-    "num_important_events": 0.0,
-    "num_covered": 0.0,
-    "precision": 0.0,
-    "recall": 0.0,
-    "f1": 0.0,
-    "summary_duration_seconds": 0.0,
-    "event_density_per_minute": 0.0,
-    "baseline_random_recall": 0.0,
-    "baseline_uniform_recall": 0.0
-  }
-}
-```
 
 ## Method Overview
 
@@ -320,32 +279,12 @@ The generated report includes the following technical metrics:
 - `baseline_random_recall`: recall achieved by randomly placed clips of similar duration.
 - `baseline_uniform_recall`: recall achieved by uniformly spaced clips of similar duration.
 
-Important events are defined by the selected user profile and the event-weight threshold used inside the evaluation function.
-
 ## Notes and Limitations
 
 - The system depends on SoccerNet annotations to generate candidate clips, so it is not fully annotation-free.
 - CLIP and Grounding DINO are used as scoring components rather than as fully trained soccer-specific models.
 - The quality of the output depends on the selected profile, annotation quality, clip windows, fusion weights, and available compute.
-- Running CLIP and Grounding DINO can be slow on CPU. A GPU is recommended for the full multimodal version.
 - SoccerNet videos are not included in this repository due to dataset access restrictions.
-
-## Suggested Environment
-
-The project was designed for Python-based experimentation using common computer vision and machine learning libraries. A typical environment is:
-
-```text
-Python 3.10+
-OpenCV
-NumPy
-Pillow
-TQDM
-Librosa
-PyTorch
-Transformers
-SoccerNet
-ffmpeg
-```
 
 ## Author
 
