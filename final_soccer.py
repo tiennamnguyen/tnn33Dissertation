@@ -4,12 +4,12 @@ Before running the script, the required SoccerNet videos and annotation files sh
 be downloaded using download_soccernet.py. The expected data directory is: data/SoccerNet/ for video and labels
 
 To run (full pipeline):
-    python final_soccer.py \\
-        --video /path/to/1_224p.mkv \\
-        --labels /path/to/Labels-v2.json \\
-        --half 1 \\
-        --profile goals \\
-        --use_clip --use_grounding --use_audio --use_flow \\
+    python final_soccer.py \
+        --video /path/to/1_224p.mkv \
+        --labels /path/to/Labels-v2.json \
+        --half 1 \
+        --profile goals \
+        --use_clip --use_grounding --use_audio --use_flow \
         --output highlights_v2.mp4
 
 Note: Running the code requires the SoccerNet dataset, which necessitates access permission requirements.
@@ -29,14 +29,13 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-
 import cv2
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
 
-# Event-profile weights 
+# Event-profile weights
 EVENT_WEIGHTS: Dict[str, Dict[str, float]] = {
     "goals": {
         "Goal": 1.00, "Shots on target": 0.85, "Shots off target": 0.65,
@@ -151,7 +150,8 @@ SCENE_WEIGHTS: Dict[str, Dict[str, float]] = {
         "replay": 0.15, "wide_tactical_view": 0.15,
     },
 }
-# SoccerNet provides data for grounding, but Grounding DINO was explored instead 
+
+# SoccerNet provides data for grounding, but Grounding DINO was explored instead
 # to assess multimodal techniques with scoring key clips
 GROUNDING_TERMS = [
     "soccer ball", "football goal", "goalkeeper",
@@ -196,12 +196,12 @@ class CandidateClip:
     start: float
     end: float
     event_score: float = 0.0
-    context_bonus: float = 0.0     
+    context_bonus: float = 0.0
     scene_score: float = 0.0
     grounding_score: float = 0.0
-    audio_score: float = 0.0       
-    flow_score: float = 0.0        
-    replay_prob: float = 0.0       
+    audio_score: float = 0.0
+    flow_score: float = 0.0
+    replay_prob: float = 0.0
     final_score: float = 0.0
     scene_details: Optional[Dict[str, float]] = field(default=None)
     grounding_details: Optional[Dict[str, float]] = field(default=None)
@@ -236,6 +236,7 @@ def parse_labels_v2(labels_path: Path, half: Optional[int] = None) -> List[dict]
         parsed.append({"label": label, "half": ann_half, "event_time": event_time, "raw": ann})
 
     return parsed
+
 
 def game_context_bonus(event_time: float, video_duration: float, max_bonus: float = 0.12) -> float:
     if video_duration <= 0:
@@ -282,6 +283,7 @@ def build_candidates(
         ))
 
     return candidates
+
 
 class FrameCache:
     """
@@ -330,7 +332,7 @@ def extract_frames(
     video_path: Path,
     start: float,
     end: float,
-    num_frames: int = 8,      
+    num_frames: int = 8,
 ) -> List[Image.Image]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -359,7 +361,7 @@ def extract_frames(
     return frames
 
 
-# Optical flow motion-intensity scorer, 
+# Optical flow motion-intensity scorer
 def compute_flow_score(frames: List[Image.Image]) -> float:
     '''
     Computes mean dense-optical-flow magnitude across consecutive frame pairs.
@@ -388,19 +390,19 @@ def compute_flow_score(frames: List[Image.Image]) -> float:
         return 0.0
     return float(np.tanh(np.mean(magnitudes) / 10.0))
 
+
 # Audio excitement score
 class AudioExcitementScorer:
     '''
     Extracts the audio track from the video via ffmpeg, then scores each
-    candidate clip on two librosa-derived signals:
+    candidate clip using RMS energy and onset strength.
     '''
     def __init__(self, video_path: Path, sr: int = 16_000):
         try:
             import librosa
             self._lib = librosa
-        except ImportError:
-            raise ImportError(
-            )
+        except ImportError as exc:
+            raise ImportError("librosa is required for --use_audio. Install it with: pip install librosa") from exc
 
         self.sr = sr
         self.audio: Optional[np.ndarray] = None
@@ -457,6 +459,7 @@ class AudioExcitementScorer:
         flux_score = float(np.mean(onset_env)) / self._flux_max
         return float(np.clip(0.60 * rms_score + 0.40 * flux_score, 0.0, 1.0))
 
+
 # CLIP scene recognizer  (cosine similarity + sigmoid + ensembling)
 class ClipSceneRecognizer:
     def __init__(
@@ -471,13 +474,14 @@ class ClipSceneRecognizer:
         self._torch = torch
         self._F = F
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
         self.processor = CLIPProcessor.from_pretrained(model_id)
         self.model = CLIPModel.from_pretrained(model_id).to(self.device)
         self.model.eval()
 
         self.concept_names = list(SCENE_PROMPT_SETS.keys())
 
-        # Build flat prompt list and track which concept each belongs to
+        # Build flat prompt list and track which concept each prompt belongs to.
         self._all_prompts: List[str] = []
         self._prompt_to_concept: List[int] = []
         for c_idx, name in enumerate(self.concept_names):
@@ -485,33 +489,92 @@ class ClipSceneRecognizer:
                 self._all_prompts.append(prompt)
                 self._prompt_to_concept.append(c_idx)
 
-        # Pre-encode text features once – reused for every clip
+        # Pre-encode text features once and reuse them for every candidate clip.
         with self._torch.no_grad():
-            text_in = self.processor(
-                text=self._all_prompts, return_tensors="pt", padding=True
+            text_inputs = self.processor(
+                text=self._all_prompts,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
             )
-            text_in = {k: v.to(self.device) for k, v in text_in.items()}
-            text_feats = self.model.get_text_features(**text_in)
-            self._text_feats = self._F.normalize(text_feats, dim=-1)  # [N_prompts, D]
+            text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
+            text_feats = self._get_text_feature_tensor(text_inputs)
+            self._text_feats = self._F.normalize(text_feats, dim=-1)
+
+    def _apply_projection_if_needed(self, pooled, projection_name: str):
+        """
+        Handles transformers versions where get_text_features/get_image_features
+        returns BaseModelOutputWithPooling instead of a final projected tensor.
+        """
+        projection = getattr(self.model, projection_name, None)
+        if projection is None:
+            return pooled
+        try:
+            in_features = getattr(projection, "in_features", None)
+            if in_features is None or pooled.shape[-1] == in_features:
+                return projection(pooled)
+        except Exception:
+            pass
+        return pooled
+
+    def _get_text_feature_tensor(self, text_inputs):
+        outputs = self.model.get_text_features(**text_inputs)
+
+        # Older transformers versions return the tensor directly.
+        if isinstance(outputs, self._torch.Tensor):
+            return outputs
+
+        # Some versions/outputs may name final embeddings explicitly.
+        if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
+            return outputs.text_embeds
+
+        # transformers 5.x may return BaseModelOutputWithPooling.
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            return self._apply_projection_if_needed(outputs.pooler_output, "text_projection")
+
+        raise TypeError(f"Unsupported CLIP text output type: {type(outputs)}")
+
+    def _get_image_feature_tensor(self, image_inputs):
+        outputs = self.model.get_image_features(**image_inputs)
+
+        # Older transformers versions return the tensor directly.
+        if isinstance(outputs, self._torch.Tensor):
+            return outputs
+
+        # Some versions/outputs may name final embeddings explicitly.
+        if hasattr(outputs, "image_embeds") and outputs.image_embeds is not None:
+            return outputs.image_embeds
+
+        # transformers 5.x may return BaseModelOutputWithPooling.
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            return self._apply_projection_if_needed(outputs.pooler_output, "visual_projection")
+
+        raise TypeError(f"Unsupported CLIP image output type: {type(outputs)}")
 
     def score_frames(self, frames: List[Image.Image]) -> Dict[str, float]:
         if not frames:
             return {name: 0.0 for name in self.concept_names}
 
         with self._torch.no_grad():
-            img_in = self.processor(images=frames, return_tensors="pt", padding=True)
-            img_in = {k: v.to(self.device) for k, v in img_in.items()}
-            img_feats = self.model.get_image_features(**img_in)
-            img_feats = self._F.normalize(img_feats, dim=-1)   # [N_images, D]
+            image_inputs = self.processor(
+                images=frames,
+                return_tensors="pt",
+                padding=True,
+            )
+            image_inputs = {k: v.to(self.device) for k, v in image_inputs.items()}
 
-            # Cosine similarities scaled by logit_scale → [N_images, N_prompts]
+            img_feats = self._get_image_feature_tensor(image_inputs)
+            img_feats = self._F.normalize(img_feats, dim=-1)
+
+            # Cosine similarities scaled by CLIP logit scale -> [N_images, N_prompts].
             logit_scale = self.model.logit_scale.exp()
             sim = (img_feats @ self._text_feats.T) * logit_scale
-            # Sigmoid: independent score per (image, prompt) – no zero-sum
-            per_prompt = self._torch.sigmoid(sim).cpu().numpy()   # [N_images, N_prompts]
 
-        # Average across frames, then average across phrasings per concept
-        avg_per_prompt = per_prompt.mean(axis=0)   # [N_prompts]
+            # Sigmoid gives independent concept scores, unlike softmax which forces competition.
+            per_prompt = self._torch.sigmoid(sim).cpu().numpy()
+
+        # Average across frames, then average across phrasings per concept.
+        avg_per_prompt = per_prompt.mean(axis=0)
         concept_scores: Dict[str, float] = {}
         for c_idx, name in enumerate(self.concept_names):
             indices = [i for i, ci in enumerate(self._prompt_to_concept) if ci == c_idx]
@@ -552,9 +615,7 @@ class GroundingDinoScorer:
         Returns a spatial multiplier in [0.7, 1.5] based on detection position.
 
         Ball, goal, and goalkeeper detections near the centre of the frame
-        (approximating the goal / penalty area in a broadcast wide-angle shot)
-        are up-weighted.  Referee and card detections are up-weighted anywhere
-        because they can appear anywhere on the pitch.
+        are up-weighted. Referee and card detections are up-weighted anywhere.
         """
         x1, y1, x2, y2 = box
         cx = ((x1 + x2) / 2) / max(img_w, 1)
@@ -577,22 +638,38 @@ class GroundingDinoScorer:
 
         counts = {term: 0.0 for term in GROUNDING_TERMS}
 
-        for image in frames[:4]:   
+        for image in frames[:4]:
             w, h = image.size
+
             with self._torch.no_grad():
                 inputs = self.processor(
-                    images=image, text=self.text_prompt, return_tensors="pt"
+                    images=image,
+                    text=self.text_prompt,
+                    return_tensors="pt",
                 )
                 inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
                 outputs = self.model(**inputs)
                 target_sizes = self._torch.tensor([[h, w]], device=self.device)
-                results = self.processor.post_process_grounded_object_detection(
-                    outputs,
-                    input_ids=inputs.get("input_ids"),
-                    box_threshold=self.box_threshold,
-                    text_threshold=self.text_threshold,
-                    target_sizes=target_sizes,
-                )[0]
+
+                try:
+                    # transformers 5.x uses `threshold`.
+                    results = self.processor.post_process_grounded_object_detection(
+                        outputs,
+                        inputs.get("input_ids"),
+                        threshold=self.box_threshold,
+                        text_threshold=self.text_threshold,
+                        target_sizes=target_sizes,
+                    )[0]
+                except TypeError:
+                    # Older transformers versions may use `box_threshold`.
+                    results = self.processor.post_process_grounded_object_detection(
+                        outputs,
+                        input_ids=inputs.get("input_ids"),
+                        box_threshold=self.box_threshold,
+                        text_threshold=self.text_threshold,
+                        target_sizes=target_sizes,
+                    )[0]
 
             labels_out = results.get("text_labels", results.get("labels", []))
             scores_out = results.get("scores", [])
@@ -601,21 +678,22 @@ class GroundingDinoScorer:
             for lbl, score, box in zip(labels_out, scores_out, boxes_out):
                 lbl_text = str(lbl).lower()
                 conf = float(score.detach().cpu()) if hasattr(score, "detach") else float(score)
+
                 coords: Tuple[float, float, float, float] = (
-                    tuple(float(v) for v in box.detach().cpu().tolist())  # type: ignore[assignment]
+                    tuple(float(v) for v in box.detach().cpu().tolist())
                     if hasattr(box, "detach") else tuple(float(v) for v in box)
                 )
+
                 for term in GROUNDING_TERMS:
                     if term.lower() in lbl_text:
                         sw = self._spatial_weight(coords, term, w, h)
                         counts[term] += conf * sw
 
-        # Saturating exponential compression to [0, 1)
+        # Saturating exponential compression to [0, 1).
         return {term: float(1.0 - math.exp(-v)) for term, v in counts.items()}
 
 
 # Fusion utilities
-
 def weighted_average(scores: Dict[str, float], weights: Dict[str, float]) -> float:
     total = sum(weights.values())
     if total <= 0:
@@ -647,33 +725,31 @@ def score_candidates(
         if use_clip or use_grounding or use_flow:
             frames = extract_frames(video_path, cand.start, cand.end, num_frames=clip_frames)
 
-        # ── CLIP scene recognition ──
+        # CLIP scene recognition
         if clip_model is not None and frames:
             scene_scores = clip_model.score_frames(frames)
             cand.scene_details = scene_scores
-            # Replay gate: record probability before folding into scene score
             cand.replay_prob = float(scene_scores.get(REPLAY_CONCEPT, 0.0))
             cand.scene_score = weighted_average(scene_scores, SCENE_WEIGHTS[profile])
 
-        # ── Grounding DINO ──
+        # Grounding DINO
         if grounding_model is not None and frames:
             grounding_scores = grounding_model.score_frames(frames)
             cand.grounding_details = grounding_scores
             cand.grounding_score = weighted_average(grounding_scores, GROUNDING_WEIGHTS[profile])
 
-        # ── Audio excitement ──
+        # Audio excitement
         if audio_scorer is not None:
             cand.audio_score = audio_scorer.score_clip(cand.start, cand.end)
 
-        # ── Optical flow motion intensity ──
+        # Optical flow motion intensity
         if use_flow and len(frames) >= 2:
             cand.flow_score = compute_flow_score(frames)
 
-        # ── Replay gate: down-weight clips with high replay probability ──
+        # Replay gate: down-weight clips with high replay probability.
         replay_factor = REPLAY_DOWN_WEIGHT if cand.replay_prob >= REPLAY_THRESHOLD else 1.0
 
-        # ── Normalised weighted fusion ──
-        # The context_bonus is treated as a fraction of the event channel weight.
+        # Normalised weighted fusion.
         active: Dict[str, float] = {
             "event": w_event,
         }
@@ -699,8 +775,8 @@ def score_candidates(
 
     return candidates
 
-# MMR-style diverse clip selection
 
+# MMR-style diverse clip selection
 def mmr_select(
     candidates: List[CandidateClip],
     max_summary_seconds: float = 120.0,
@@ -753,8 +829,8 @@ def mmr_select(
 
     return sorted(selected, key=lambda c: c.start)
 
-# Evaluation : F1 score, precision, recall, baselines
 
+# Evaluation: F1 score, precision, recall, baselines
 def _count_covered_events(clips: List[CandidateClip], events: List[dict]) -> int:
     return sum(
         1 for ann in events
@@ -799,12 +875,12 @@ def evaluate_coverage(
         if weights.get(ann["label"], 0.0) >= important_threshold
     ]
 
-    # ── Main system metrics ──
+    # Main system metrics
     covered = _count_covered_events(selected, important)
     sel_dur = sum(max(0.0, c.end - c.start) for c in selected)
     recall = covered / len(important) if important else 0.0
 
-    # Precision: clips that contain at least one important event
+    # Precision: clips that contain at least one important event.
     clips_with_event = sum(
         1 for clip in selected
         if any(
@@ -819,7 +895,7 @@ def evaluate_coverage(
     )
     density = covered / (sel_dur / 60.0) if sel_dur > 0 else 0.0
 
-    # ── Baselines ──
+    # Baselines
     mean_dur = float(np.mean([c.end - c.start for c in selected])) if selected else 15.0
     n = len(selected) or 1
 
@@ -840,8 +916,8 @@ def evaluate_coverage(
         "baseline_uniform_recall": float(unif_recall),
     }
 
-# Export with ffmpeg  
 
+# Export with ffmpeg
 def _run_cmd(cmd: List[str]) -> None:
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
@@ -885,7 +961,6 @@ def export_summary(video_path: Path, clips: List[CandidateClip], output_path: Pa
 
 
 # Raw data
-
 def save_report(
     clips: List[CandidateClip],
     eval_report: Dict[str, float],
@@ -905,60 +980,60 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Data ──
-    parser.add_argument("--video",   type=Path, required=True,
+    # Data
+    parser.add_argument("--video", type=Path, required=True,
                         help="Path to SoccerNet half video, e.g. 1_720p.mkv")
-    parser.add_argument("--labels",  type=Path, required=True,
+    parser.add_argument("--labels", type=Path, required=True,
                         help="Path to Labels-v2.json")
-    parser.add_argument("--half",    type=int, default=None, choices=[1, 2],
+    parser.add_argument("--half", type=int, default=None, choices=[1, 2],
                         help="Filter annotations to a single half")
     parser.add_argument("--profile", type=str, default="balanced",
                         choices=list(EVENT_WEIGHTS),
                         help="Event-weighting profile")
 
-    # ── Output ──
+    # Output
     parser.add_argument("--output", type=Path, default=Path("summary_v2.mp4"))
     parser.add_argument("--report", type=Path, default=Path("summary_report_v2.json"))
 
-    # ── Clip window ──
-    parser.add_argument("--pre_context",  type=float, default=8.0,
+    # Clip window
+    parser.add_argument("--pre_context", type=float, default=8.0,
                         help="Seconds before event anchor")
     parser.add_argument("--post_context", type=float, default=10.0,
                         help="Seconds after event anchor")
 
-    # ── Selection ──
+    # Selection
     parser.add_argument("--max_summary_seconds", type=float, default=120.0)
-    parser.add_argument("--top_k",    type=int,   default=12)
-    parser.add_argument("--min_gap",  type=float, default=5.0,
+    parser.add_argument("--top_k", type=int, default=12)
+    parser.add_argument("--min_gap", type=float, default=5.0,
                         help="Minimum gap (s) between selected clips")
     parser.add_argument("--lambda_mmr", type=float, default=0.70,
                         help="MMR trade-off: 1.0=pure relevance, 0.0=pure diversity")
 
-    # ── Modality flags ──
-    parser.add_argument("--use_clip",      action="store_true",
+    # Modality flags
+    parser.add_argument("--use_clip", action="store_true",
                         help="Enable CLIP scene recognition (cosine-sim + sigmoid)")
     parser.add_argument("--use_grounding", action="store_true",
                         help="Enable Grounding DINO with spatial analysis")
-    parser.add_argument("--use_audio",     action="store_true",
+    parser.add_argument("--use_audio", action="store_true",
                         help="Enable librosa audio excitement scoring")
-    parser.add_argument("--use_flow",      action="store_true",
+    parser.add_argument("--use_flow", action="store_true",
                         help="Enable dense optical-flow motion intensity")
-    parser.add_argument("--clip_frames",   type=int, default=8,
+    parser.add_argument("--clip_frames", type=int, default=8,
                         help="Frames sampled per clip for vision models")
 
-    # ── Fusion weights (ablation-ready) ──
-    parser.add_argument("--w_event",      type=float, default=0.45)
-    parser.add_argument("--w_scene",      type=float, default=0.20)
-    parser.add_argument("--w_grounding",  type=float, default=0.10)
-    parser.add_argument("--w_audio",      type=float, default=0.15)
-    parser.add_argument("--w_flow",       type=float, default=0.10)
+    # Fusion weights (ablation-ready)
+    parser.add_argument("--w_event", type=float, default=0.45)
+    parser.add_argument("--w_scene", type=float, default=0.20)
+    parser.add_argument("--w_grounding", type=float, default=0.10)
+    parser.add_argument("--w_audio", type=float, default=0.15)
+    parser.add_argument("--w_flow", type=float, default=0.10)
 
     args = parser.parse_args()
 
-    # ── Pipeline ──
-    duration    = get_video_duration(args.video)
+    # Pipeline
+    duration = get_video_duration(args.video)
     annotations = parse_labels_v2(args.labels, half=args.half)
-    candidates  = build_candidates(
+    candidates = build_candidates(
         annotations,
         video_duration=duration,
         profile=args.profile,
